@@ -1,0 +1,5 @@
+{
+  "module": "RootDNA",
+  "api": 1,
+  "entry": "root_dna.py"
+}
