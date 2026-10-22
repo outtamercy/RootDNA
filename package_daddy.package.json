@@ -1,0 +1,17 @@
+{
+  "format": 2,
+  "id": "root-dna",
+  "name": "RootDNA",
+  "kind": "mo2-plugin",
+  "version": "2.0.0",
+  "install_root": "root_dna",
+  "nexus_url": "https://www.nexusmods.com/skyrimspecialedition/mods/192430",
+  "discord_url": "https://discord.gg/We2jgKAaVR",
+  "files": [
+    "__init__.py",
+    "root_dna.py",
+    "scanner.py",
+    "root_dna.module.json",
+    "package_daddy.package.json"
+  ]
+}

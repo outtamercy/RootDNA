@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderV
 
 MODULE_API = 1
 MODULE_MARKER = "root_dna.module.json"
-logger = logging.getLogger("FileWatchdog")
+logger = logging.getLogger("RootDNA")
 
 def _now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
 def _json(path, default):
@@ -40,11 +40,20 @@ class RootDNA:
         safe_profile = quote(paths.profile_name, safe="")
         self.state = self.plugin_dir.parent / "data" / "root_dna" / "profiles" / safe_profile
         self.definition_path = self.state / "rootdna_definition.json"
-        self.manifest_path = self.state / "fw_manifest.json"
-        self.audit_path = self.state / "fw_audit.log"
+        # The tab-era build used fw_manifest.json.  Keep reading that exact
+        # receipt if it already exists: deployed links do not get a surprise
+        # amnesia just because RootDNA moved out of FW's window.
+        standalone_manifest = self.state / "rootdna_manifest.json"
+        legacy_manifest = self.state / "fw_manifest.json"
+        self.manifest_path = standalone_manifest if standalone_manifest.exists() or not legacy_manifest.exists() else legacy_manifest
+        self.audit_path = self.state / "rootdna_audit.log"
         self.status_path = self.state / "rootdna_status.log"
         self.lock_path = self.state / "rootdna.lock"
-        self.cache_root = paths.mods / "FW-RootCache" / safe_profile
+        # Backups and receipts are private RootDNA state, never an MO2 mod and
+        # never File Watchdog's business. Existing manifest backup receipts
+        # retain their original explicit paths and are still restored exactly.
+        self.cache_root = self.state / "backups"
+        self.marker_root = self.state / "markers"
     def definition(self): return _json(self.definition_path, {})
     def manifest(self): return _json(self.manifest_path, {"schema_version": 1, "links": []})
     def game_identity(self):
@@ -70,14 +79,16 @@ class RootDNA:
         game_root = self.paths.game_root
         if not game_root or not self.state.parent.is_dir(): return []
         found = []
-        for candidate in self.state.parent.glob("*/fw_manifest.json"):
+        candidates = list(self.state.parent.glob("*/rootdna_manifest.json")) + list(self.state.parent.glob("*/fw_manifest.json"))
+        for candidate in candidates:
             if candidate == self.manifest_path: continue
             manifest = _json(candidate, {})
             if manifest.get("links") and _normal(manifest.get("game_root", "")) == _normal(game_root):
                 found.append(manifest.get("profile", candidate.parent.name))
-        return found
+        return list(dict.fromkeys(found))
     def create_template(self):
-        if self.definition_path.exists(): raise RuntimeError("RootDNA definition already exists. It won't trample your homework.")
+        if self.definition_path.exists():
+            raise RuntimeError("RootDNA profile already exists. Use Remove RootDNA to clear it first.")
         game = str(self.paths.game_root) if self.paths.game_root else ""
         _atomic_json(self.definition_path, {
             "schema_version": 1, "profile": self.paths.profile_name, "game_root": game, "game_identity": self.game_identity(),
@@ -105,72 +116,65 @@ class RootDNA:
             return "managed" if matches and all(matches) else ("partly managed — hands off" if any(matches) else "available")
         signatures = (
             ("creation-kit-ae", "Creation Kit AE root payload", "RootDNA - Creation Kit", (
-                "CreationKit.exe", "CreationKit.ini", "CreationKitCustom.ini", "CreationKitPrefs.ini",
+                "CreationKit.exe", "CreationKit.ini", "CreationKitCustom.ini", "CreationKitPrefs.ini")),
+            ("ck-platform-extended", "CK Platform Extended root payload", "RootDNA - CK Platform Extended", (
+                "ckpe_loader.exe", "CKPE.Common.dll", "CKPE.dll", "CKPE.Installer.exe", "CKPE.PluginAPI.dll", "CKPE.SkyrimSE.dll",
                 "CreationKitPlatformExtended_SSE_Databases.pak", "CreationKitPlatformExtended_SSE_Dialogs.pak",
                 "CreationKitPlatformExtended.toml", "CreationKitPlatformExtendedCustomTheme.toml",
                 "CreationKitPlatformExtendedMessagesBlacklist.txt")),
-            ("ck-platform-extended", "CK Platform Extended root payload", "RootDNA - CK Platform Extended", (
-                "ckpe_loader.exe", "CKPE.Common.dll", "CKPE.dll", "CKPE.Installer.exe", "CKPE.PluginAPI.dll", "CKPE.SkyrimSE.dll")),
             ("skse-ae", "SKSE AE root payload", "RootDNA - SKSE", (
                 "skse64_loader.exe", "skse64_loader_original.exe", "skse64_steam_loader.dll", "skse64_1_6_1170.dll")),
-            ("enb", "ENB root payload", "RootDNA - ENB", (
-                "d3d11.dll", "d3dcompiler_46e.dll", "enbseries", "enbseries.ini", "enblocal.ini", "enbhost.exe")),
+            ("enb-binaries", "ENB binary payload", "RootDNA - ENB", (
+                "d3d11.dll", "d3dcompiler_46e.dll", "enbhost.exe")),
             ("reshade", "ReShade root payload", "RootDNA - ReShade", (
                 "dxgi.dll", "ReShade.ini", "reshade-shaders")),
-            ("engine-fixes", "Engine Fixes Part 2 root payload", "RootDNA - Engine Fixes", (
-                "d3dx9_42.dll", "tbb.dll", "tbbmalloc.dll")),
-            ("opencomposite", "OpenComposite root payload", "RootDNA - OpenComposite", (
-                "openvr_api.dll", "opencomposite.ini")),
+            ("engine-fixes-preloader", "Engine Fixes SKSE64 Preloader root payload", "RootDNA - Engine Fixes Preloader", (
+                "d3dx9_42.dll",)),
             ("spatial-audio", "Spatial audio root payload", "RootDNA - Spatial Audio", (
                 "x3daudio1_7.dll", "hrtf")),
         )
         found = []
-        claimed = set()
         for ident, title, mod, names in signatures:
             present = tuple((name, "directory" if (game_root / name).is_dir() else "file") for name in names if (game_root / name).is_file() or (game_root / name).is_dir())
-            # A payload needs its actual anchor. Don't offer an ENB because a
-            # random ini exists, or SKSE because a stray old loader got left behind.
-            # d3d11.dll alone is ambiguous: ENB and some ReShade installs use
-            # it. An ENB config is the needed receipt; otherwise it stays
-            # unclassified for the user to inspect.
-            anchor = {"creation-kit-ae": "CreationKit.exe", "ck-platform-extended": "ckpe_loader.exe", "skse-ae": "skse64_loader.exe", "enb": "enbseries.ini", "reshade": "dxgi.dll", "engine-fixes": "d3dx9_42.dll", "opencomposite": "openvr_api.dll", "spatial-audio": "x3daudio1_7.dll"}[ident]
-            if any(name == anchor for name, _kind in present):
-                claimed.update(name.lower() for name, _kind in present)
+            # A payload needs its actual anchor. A stray loader does not make
+            # a complete payload, but a known partial stays out of discovery.
+            anchor = {"creation-kit-ae": "CreationKit.exe", "ck-platform-extended": "ckpe_loader.exe", "skse-ae": "skse64_loader.exe", "enb-binaries": "d3d11.dll", "reshade": "dxgi.dll", "engine-fixes-preloader": "d3dx9_42.dll", "spatial-audio": "x3daudio1_7.dll"}[ident]
+            present_names = {name.lower() for name, _kind in present}
+            if anchor.lower() in present_names:
                 found.append({"kind": "game-root-payload", "id": ident, "title": title, "mod": mod,
                               "source": game_root, "status": state_for(present), "items": present, "count": len(present),
                               # Header Select All is for the boring, known stuff.
                               # Anything heuristic gets its own deliberate tick.
                               "auto_select": True})
-        # Vanilla's root furniture stays out of the candidate pile. Everything
-        # else is merely shown as an unclassified direct-root payload—never
-        # grabbed until the user ticks it.
-        stock = {"bink2w64.dll", "d3dcompiler_46.dll", "installscript.vdf", "skyrim_default.ini", "skyrim.ccc",
-                 "skyrimreservedaddonindexes.txt", "skyrimse.exe", "skyrimselauncher.exe", "steam_api64.dll",
-                 "high.ini", "medium.ini", "low.ini", "ultra.ini"}
-        stock.update(name.lower() for name in self.paths.game_executables())
-        ignored = stock | claimed | {"data", "_commonredist", "logs", "crashdumps", "modorganizer"}
-        loose = []
-        for item in game_root.iterdir():
-            if item.name.lower() in ignored or item.name.startswith("."): continue
-            if item.is_dir() or item.is_file(): loose.append((item.name, "directory" if item.is_dir() else "file"))
-        if loose:
-            digest = hashlib.sha1("|".join(name.lower() for name, _kind in loose).encode("utf-8")).hexdigest()[:10]
-            loose_state = state_for(tuple(loose))
-            found.append({"kind": "game-root-payload", "id": "unclassified-" + digest, "title": "Unclassified game-root payload", "mod": "RootDNA - Unclassified Root Payload",
-                          "source": game_root, "status": "needs your eyeballs" if loose_state == "available" else loose_state, "items": tuple(loose), "count": len(loose), "auto_select": False})
+        # Never offer a generic game-root catch-all. Logs, backups, presets,
+        # and unknown folders belong to the user unless RootDNA has a named,
+        # reviewed payload definition for them.
         return found
     def mod_root_candidates(self):
-        """Check only a mod's top level and explicit Root wrappers. No crawl."""
+        """Offer only reviewed runtime shapes from a mod's top level or Root."""
         wrappers = ("root", "game root", "gameroot", "game_root", "root files")
         skipped = {"data", "fomod", "optional files", "docs", "documentation", "screenshots", "meta.ini"}
+        signatures = (
+            ("enb-binaries", "ENB binaries", ("d3d11.dll", "d3dcompiler_46e.dll", "enbhost.exe"), "d3d11.dll"),
+            ("creation-kit-ae", "Creation Kit", ("CreationKit.exe", "CreationKit.ini", "CreationKitCustom.ini", "CreationKitPrefs.ini"), "CreationKit.exe"),
+            ("ck-platform-extended", "CK Platform Extended", (
+                "ckpe_loader.exe", "CKPE.Common.dll", "CKPE.dll", "CKPE.Installer.exe", "CKPE.PluginAPI.dll", "CKPE.SkyrimSE.dll",
+                "CKPEBins", "CreationKitPlatformExtended_SSE_Databases.pak", "CreationKitPlatformExtended_SSE_Dialogs.pak",
+                "CreationKitPlatformExtended.toml", "CreationKitPlatformExtendedCustomTheme.toml", "CreationKitPlatformExtendedMessagesBlacklist.txt",
+                "d3dcompiler_46.dll", "icons.bmp", "navmesh.bmp", "toolbar.bmp", "winhttp.dll"), "ckpe_loader.exe"),
+            ("skse-ae", "SKSE", ("skse64_loader.exe", "skse64_loader_original.exe", "skse64_steam_loader.dll", "skse64_1_6_1170.dll"), "skse64_loader.exe"),
+            ("reshade", "ReShade", ("dxgi.dll", "ReShade.ini", "reshade-shaders"), "dxgi.dll"),
+            ("engine-fixes-preloader", "Engine Fixes SKSE64 Preloader", ("d3dx9_42.dll",), "d3dx9_42.dll"),
+            ("spatial-audio", "Spatial Audio", ("x3daudio1_7.dll", "hrtf"), "x3daudio1_7.dll"),
+        )
         game_root = self.paths.game_root
-        live_ck = game_root / "CreationKit.exe" if game_root else None
-        # The selected physical game root wins for known payload groups. A
-        # duplicate mod copy is an alternate source, not another thing that
-        # gets to fight over CreationKit.exe or CKPE's shared support files.
-        physical_names = {name.lower() for candidate in self.root_payload_candidates() for name, _kind in candidate["items"]}
+        live_names = {name.lower() for candidate in self.root_payload_candidates()
+                      if candidate.get("kind") == "game-root-payload"
+                      for name, _kind in candidate.get("items", ())}
         found = []
-        learned = {item.get("candidate_id"): item for item in self.definition().get("learned_adoptions", [])}
+        definition = self.definition()
+        learned = {item.get("candidate_id"): item for item in definition.get("learned_adoptions", [])}
+        declared = {item.get("id") for item in definition.get("payloads", [])}
         for mod, enabled in self.paths.listed_mods():
             if mod.lower().startswith("rootdna - "): continue
             lowered_mod = mod.lower()
@@ -180,24 +184,19 @@ class RootDNA:
             sources.extend((child.name, child) for child in mod_root.iterdir() if child.is_dir() and child.name.lower() in wrappers)
             for source_name, source in sources:
                 if source_name == "." and any(child.is_dir() and child.name.lower() in wrappers for child in mod_root.iterdir()): continue
-                items = tuple((child.name, "directory" if child.is_dir() else "file") for child in source.iterdir() if child.name.lower() not in skipped and (child.is_file() or child.is_dir()))
-                if not items: continue
-                # Bare mod roots need an actual loader/proxy binary. Root-level
-                # INIs are normal mod guts all the time, and treating those as
-                # root payloads is how you summon a thousand rows.
-                if source_name == "." and not any(kind == "file" and Path(name).suffix.lower() in {".exe", ".dll", ".asi"} for name, kind in items): continue
-                source_ck = source / "CreationKit.exe"
-                # When the selected game already has CK, RootDNA migrates that
-                # exact copy. Extra CK mods are alternates, not additional
-                # candidates for the same game-root filenames.
-                if source_ck.is_file() and live_ck and live_ck.is_file(): continue
-                if any(name.lower() in physical_names for name, _kind in items): continue
-                digest = hashlib.sha1(f"{mod}|{source_name}".encode("utf-8")).hexdigest()[:10]
-                candidate_id = "mod-root-" + digest
-                learned_rule = learned.get(candidate_id)
-                found.append({"kind": "mod-root-payload", "id": candidate_id, "title": f"{mod} — root payload", "mod": mod, "source_name": source_name,
-                              "source": source, "status": "learned — managed" if learned_rule else ("enabled — available" if enabled else "disabled — available"), "items": items, "count": len(items),
-                              "auto_select": False})
+                available = {child.name.lower(): (child.name, "directory" if child.is_dir() else "file")
+                             for child in source.iterdir() if child.name.lower() not in skipped and (child.is_file() or child.is_dir())}
+                for ident, title, names, anchor in signatures:
+                    if anchor.lower() not in available: continue
+                    items = tuple(available[name.lower()] for name in names if name.lower() in available)
+                    # A game-root package wins over a duplicate file in a mod.
+                    if any(name.lower() in live_names for name, _kind in items): continue
+                    digest = hashlib.sha1(f"{mod}|{source_name}|{ident}".encode("utf-8")).hexdigest()[:10]
+                    candidate_id = "mod-root-" + digest
+                    learned_rule = learned.get(candidate_id)
+                    found.append({"kind": "mod-root-payload", "id": candidate_id, "title": f"{mod} — {title}", "mod": mod, "source_name": source_name,
+                                  "source": source, "status": "managed" if candidate_id in declared else ("learned — managed" if learned_rule else ("enabled — available" if enabled else "disabled — enable it before RootDNA deploys it")), "items": items, "count": len(items),
+                                  "auto_select": False})
         return found
     def pending_adoptions(self):
         definition = self.definition(); pending = definition.get("pending_adoptions", [])
@@ -246,16 +245,26 @@ class RootDNA:
         if not isinstance(payloads, list): raise RuntimeError("RootDNA payload list is missing.")
         game_root = game_root.resolve(); self._validate_stock_game(definition, game_root)
         return definition, game_root
-    def _plans(self):
+    def _mod_enabled(self, name):
+        return dict(self.paths.listed_mods()).get(name, False)
+    @staticmethod
+    def _follows_mod_state(payload):
+        """User-owned mod sources follow MO2; migrated RootDNA payloads persist."""
+        return bool(payload.get("follow_mod_state", not payload.get("return_to_game_on_remove", False)))
+    def _plans(self, include_inactive=False):
         definition, game_root = self._validated_definition(); plans = []
         for payload in definition["payloads"]:
             for required in ("id", "mod", "source", "links"):
                 if required not in payload: raise RuntimeError(f"Payload is missing {required}.")
+            if not include_inactive and self._follows_mod_state(payload) and not self._mod_enabled(payload["mod"]):
+                continue
             links = payload["links"]
             if not isinstance(links, list): raise RuntimeError(f"{payload['id']}: links must be a list.")
             # Empty template payloads are allowed. They are instructions, not
             # a half-deployed mod that should throw a bogus path tantrum.
             if not links: continue
+            if payload.get("return_to_game_on_remove") and str(payload.get("id", "")).startswith("unclassified-") and len(links) > 1:
+                raise RuntimeError("This RootDNA profile contains the retired broad unclassified payload. Remove RootDNA to restore it, then adopt only the individual root item(s) you actually want.")
             source_root = (self.paths.mods / payload["mod"] / payload["source"]).resolve()
             mod_root = (self.paths.mods / payload["mod"]).resolve()
             if not source_root.is_dir() or not _inside(source_root, mod_root): raise RuntimeError(f"{payload['id']}: make {self.paths.mods / payload['mod'] / payload['source']} first, then put its declared root payload there.")
@@ -329,17 +338,86 @@ class RootDNA:
     def _marker_matches(self, marker, signature, target, source):
         data = _json(marker, {})
         return data.get("signature") == signature and data.get("target") == str(target) and data.get("source") == str(source)
+    def _marker_or_provable(self, marker, signature, target, source, record):
+        if self._marker_matches(marker, signature, target, source): return True
+        # A present-but-wrong receipt is tampering. A missing old receipt is
+        # recoverable only when the link itself proves the recorded source, or
+        # when there is no target left to delete/overwrite.
+        if marker.exists(): return False
+        return self._disk_matches(record, target, source) or (self._target_missing(target) and source.exists())
+    def _write_marker(self, signature, target, source):
+        marker = self.marker_root / (signature + ".json")
+        _atomic_json(marker, {"signature": signature, "target": str(target), "source": str(source), "created": _now()})
+        return marker
     def _disk_matches(self, record, target, source):
         if record.get("link_mode") == "hardlink":
             try: return target.is_file() and os.path.samefile(target, source)
             except OSError: return False
         return _is_reparse(target) and target.resolve() == source.resolve()
+    @staticmethod
+    def _target_missing(target):
+        """Path.exists is false for a broken symlink, so test both forms."""
+        return not target.exists() and not target.is_symlink()
+    @staticmethod
+    def _actual_link_state(target):
+        if RootDNA._target_missing(target): return "missing"
+        if _is_reparse(target):
+            try: return "reparse point to " + str(target.resolve())
+            except OSError: return "unreadable reparse point"
+        return "ordinary file or directory"
+    def _conflict(self, action, target, source):
+        return (f"RootDNA {action} conflict: {target}\n"
+                f"Expected source: {source}\n"
+                f"What is there now: {self._actual_link_state(target)}\n"
+                "No files were touched. A missing link can be repaired; a different live file needs a human decision.")
+    def _create_link(self, source, target, kind, preferred_mode=None):
+        """Create exactly the declared link type; never copy as a fallback."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if kind == "directory":
+            completed = subprocess.run(["cmd", "/d", "/c", "mklink", "/J", str(target), str(source)], capture_output=True, text=True, creationflags=0x08000000)
+            if completed.returncode: raise RuntimeError(f"Couldn't make junction {target}: {completed.stderr or completed.stdout}")
+            return "junction"
+        if preferred_mode == "hardlink":
+            if source.drive.lower() != target.drive.lower(): raise RuntimeError(f"Can't repair {target}: its recorded hardlink source is on another drive.")
+            os.link(source, target); return "hardlink"
+        if preferred_mode == "symlink":
+            os.symlink(source, target, target_is_directory=False); return "symlink"
+        try: os.symlink(source, target, target_is_directory=False); return "symlink"
+        except OSError:
+            if source.drive.lower() != target.drive.lower(): raise RuntimeError(f"Couldn't make file link {target}; symlinks need permission and hardlinks cannot cross drives.")
+            os.link(source, target); return "hardlink"
+    def _withhold_disabled_sources(self, definition, game_root):
+        """Remove only RootDNA-owned live links for disabled ordinary mods."""
+        inactive = {payload["id"] for payload in definition.get("payloads", [])
+                    if self._follows_mod_state(payload) and not self._mod_enabled(payload["mod"])}
+        if not inactive: return []
+        manifest = self.manifest(); kept = {}; withheld = []
+        for target_text, record in ((item.get("target", ""), item) for item in manifest.get("links", [])):
+            if record.get("id") not in inactive:
+                kept[target_text] = record; continue
+            target, source, marker = Path(target_text), Path(record.get("source", "")), Path(record.get("marker", ""))
+            if not self._marker_matches(marker, record.get("signature", ""), target, source):
+                raise RuntimeError(self._conflict("manifest", target, source))
+            if self._disk_matches(record, target, source):
+                target.rmdir() if target.is_dir() else target.unlink()
+            elif not (self._target_missing(target) and source.exists()):
+                raise RuntimeError(self._conflict("link", target, source))
+            backup = Path(record["backup"]) if record.get("backup") else None
+            if backup and backup.exists():
+                if target.exists(): raise RuntimeError(f"Restore collision at {target}. Leaving backup alone.")
+                target.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(backup), str(target)); self.audit("RESTORED", str(target))
+            marker.unlink(missing_ok=True); withheld.append(record["id"]); self.audit("WITHHELD", f"disabled mod source released {target}")
+        if len(kept) != len(manifest.get("links", [])): self._save_manifest(game_root, kept)
+        return sorted(set(withheld))
     def deploy(self):
         definition = self.definition()
         definition, game_root, plans = self._plans()
-        if not plans: raise RuntimeError("No RootDNA links are declared yet. Fill the payload definition first.")
         with self._locked():
-            self._guard(definition); preview = self.preview()
+            self._guard(definition); withheld = self._withhold_disabled_sources(definition, game_root)
+            if not plans:
+                if withheld: return withheld
+                raise RuntimeError("No RootDNA links are declared yet. Fill the payload definition first.")
+            preview = self.preview()
             foreign = self.foreign_deployments()
             if foreign: raise RuntimeError("RootDNA is deployed for another profile: " + ", ".join(foreign) + ". Switch back and remove it there first.")
             bad = [state for _plan, state in preview if state == "foreign reparse point — refused"]
@@ -349,32 +427,36 @@ class RootDNA:
                 target = plan["target"]; source = plan["source"]
                 if state == "managed":
                     record = records[str(target)]
-                    if (record.get("signature") != self._signature(plan) or not self._marker_matches(Path(record.get("marker", "")), self._signature(plan), target, source)
-                            or not self._disk_matches(record, target, source)):
-                        raise RuntimeError(f"Tampered RootDNA link: {target}. Refusing the lot.")
+                    signature = self._signature(plan); marker = Path(record.get("marker", ""))
+                    if record.get("signature") != signature:
+                        raise RuntimeError(self._conflict("manifest", target, source))
+                    if not self._marker_or_provable(marker, signature, target, source, record):
+                        raise RuntimeError(self._conflict("manifest", target, source))
+                    if not self._marker_matches(marker, signature, target, source):
+                        marker = self._write_marker(signature, target, source)
+                        record["marker"] = str(marker); records[str(target)] = record; self._save_manifest(game_root, records)
+                        self.audit("REPAIRED", f"reissued missing receipt for {target}")
+                    if not self._disk_matches(record, target, source):
+                        if self._target_missing(target) and source.exists():
+                            record["link_mode"] = self._create_link(source, target, plan["kind"], record.get("link_mode"))
+                            records[str(target)] = record; self._save_manifest(game_root, records)
+                            self.audit("REPAIRED", f"recreated missing link {source} -> {target}")
+                            continue
+                        raise RuntimeError(self._conflict("link", target, source))
                     continue
                 backup = ""
                 if target.exists() or target.is_symlink():
                     backup_path = self.cache_root / "backups" / operation / target.relative_to(game_root)
                     backup_path.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(target), str(backup_path)); backup = str(backup_path)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if plan["kind"] == "directory":
-                    completed = subprocess.run(["cmd", "/d", "/c", "mklink", "/J", str(target), str(source)], capture_output=True, text=True, creationflags=0x08000000)
-                    if completed.returncode: raise RuntimeError(f"Couldn't make junction {target}: {completed.stderr or completed.stdout}")
-                    link_mode = "junction"
-                else:
-                    try: os.symlink(source, target, target_is_directory=False); link_mode = "symlink"
-                    except OSError:
-                        if source.drive.lower() != target.drive.lower(): raise RuntimeError(f"Couldn't make file link {target}; symlinks need permission and hardlinks cannot cross drives.")
-                        os.link(source, target); link_mode = "hardlink"
-                marker = self.cache_root / "markers" / (self._signature(plan) + ".json")
-                _atomic_json(marker, {"signature": self._signature(plan), "target": str(target), "source": str(source), "created": _now()})
+                link_mode = self._create_link(source, target, plan["kind"])
+                marker = self._write_marker(self._signature(plan), target, source)
                 records[str(target)] = {"id": plan["id"], "source": str(source), "target": str(target), "kind": plan["kind"], "link_mode": link_mode, "return_to_game_on_remove": plan["return_to_game_on_remove"], "signature": self._signature(plan), "backup": backup, "marker": str(marker)}
                 # Persist every completed root link. A later failure is then
                 # removable from the manifest instead of becoming an orphan.
                 self._save_manifest(game_root, records)
                 self.audit("CREATED", f"{source} -> {target}")
             self._save_manifest(game_root, records)
+        return withheld
     @staticmethod
     def _mod_name(line):
         return line[1:].strip() if line[:1] in "+-" else ""
@@ -464,18 +546,35 @@ class RootDNA:
         # The id fallback repairs the first CK adoption build, before this flag
         # existed. New adopters carry the explicit return flag.
         return [item for item in definition.get("payloads", []) if item.get("return_to_game_on_remove") or item.get("id") == "creation-kit-ae-root"]
-    def _restore_migrated_payloads(self, definition):
+    def _restore_migrated_payloads(self, definition, keep_live_targets=()):
         restored = 0; removed_mods = []
+        keep_live_targets = {str(_normal(item)) for item in keep_live_targets}
         for payload in self._migration_payloads(definition):
             source_root = self.paths.mods / payload["mod"] / payload["source"]
             for item in payload.get("links", []):
                 source, target = source_root / item["source"], self.paths.game_root / item["game"]
                 if not source.exists(): continue
-                if target.exists() or target.is_symlink(): raise RuntimeError(f"Restore collision at {target}. Leaving {source} alone.")
+                if target.exists() or target.is_symlink():
+                    if str(_normal(target)) not in keep_live_targets:
+                        raise RuntimeError(f"Restore collision at {target}. Leaving {source} alone.")
+                    # The game-root copy was changed after its hardlink was
+                    # released. It is now the live copy, so do not clobber it
+                    # with RootDNA's old source during teardown.
+                    source.rmdir() if source.is_dir() else source.unlink()
+                    self.audit("PRESERVED", f"kept changed game-root file: {target}")
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(source), str(target)); restored += 1; self.audit("RESTORED", str(target))
             mod_root = self.paths.mods / payload["mod"]
             try:
                 for folder in sorted((item for item in mod_root.rglob("*") if item.is_dir()), key=lambda item: len(item.parts), reverse=True): folder.rmdir()
+                # meta.ini was generated by RootDNA when it created this
+                # migration mod. It is the only file that should stop a clean
+                # explicit Remove from deleting an otherwise empty folder.
+                meta = mod_root / "meta.ini"
+                if meta.is_file():
+                    try: generated = "RootDNA" in meta.read_text(encoding="utf-8", errors="ignore")
+                    except OSError: generated = False
+                    if generated: meta.unlink()
                 mod_root.rmdir(); self._remove_mod_entry(payload["mod"]); removed_mods.append(payload["mod"])
             except OSError: pass
         if restored:
@@ -483,11 +582,19 @@ class RootDNA:
             _atomic_json(self.definition_path, definition)
         return restored, removed_mods
     def _reset_profile_definition(self):
-        """Remove means a clean slate; the audit stays as the paper trail."""
+        """Remove operational state; keep only the audit trail."""
         try: self.definition_path.unlink()
         except FileNotFoundError: pass
+        # Empty receipts and markers are generated state, not a profile. Clear
+        # them as part of a real reset so Create Profile truly starts blank.
+        manifest = self.manifest()
+        if not manifest.get("links"):
+            try: self.manifest_path.unlink()
+            except FileNotFoundError: pass
+        shutil.rmtree(self.marker_root, ignore_errors=True)
+        shutil.rmtree(self.cache_root, ignore_errors=True)
     def adopt_root_payload(self, candidate):
-        """Move one scanned, named root payload into its own RootDNA source mod."""
+        """Adopt one explicit root payload without touching its unrelated files."""
         definition = self.definition(); game_root = self.paths.game_root
         if not definition: raise RuntimeError("Create the RootDNA profile template first.")
         if not game_root or not game_root.is_dir(): raise RuntimeError("MO2 did not hand RootDNA a usable game path.")
@@ -500,9 +607,32 @@ class RootDNA:
         if chosen["kind"] == "mod-root-payload":
             source_root = chosen["source"].resolve(); mod_root = (self.paths.mods / chosen["mod"]).resolve()
             if not _inside(source_root, mod_root): raise RuntimeError("Mod root candidate escaped its own mod. Nope.")
+            if not chosen.get("enabled"):
+                raise RuntimeError(f"{chosen['mod']} is disabled. RootDNA will not put a disabled mod's files in the live game root. Enable it first, or migrate a game-root payload into a RootDNA-managed mod.")
+            # Keep an installed package in its own mod. Only the exact files
+            # selected for the root lane move under its Root folder; preset,
+            # Data, documentation, and all other content stay put.
+            if chosen["source_name"] == ".":
+                wrapped = mod_root / "Root"
+                if wrapped.exists(): raise RuntimeError(f"{chosen['mod']} grew a Root folder since the scan. Scan again before adopting it.")
+                moved = []
+                with self._locked():
+                    self._guard(definition); wrapped.mkdir(parents=True)
+                    try:
+                        for name, _kind in chosen["items"]:
+                            original, destination = source_root / name, wrapped / name
+                            shutil.move(str(original), str(destination)); moved.append((original, destination))
+                    except Exception:
+                        for original, destination in reversed(moved):
+                            if destination.exists() and not original.exists(): shutil.move(str(destination), str(original))
+                        try: wrapped.rmdir()
+                        except OSError: pass
+                        raise
+                source_root = wrapped; chosen = {**chosen, "source_name": "Root", "source": wrapped}
+                self.audit("NORMALIZED", f"moved {len(moved)} declared root item(s) into {wrapped}")
             payloads = [item for item in definition.get("payloads", []) if item.get("id") != chosen["id"]]
             payloads.append({"id": chosen["id"], "title": chosen["title"], "mod": chosen["mod"], "source": chosen["source_name"],
-                             "links": [{"source": name, "game": name, "kind": kind} for name, kind in chosen["items"]]})
+                             "follow_mod_state": True, "links": [{"source": name, "game": name, "kind": kind} for name, kind in chosen["items"]]})
             definition["payloads"] = payloads
             learned = [item for item in definition.get("learned_adoptions", []) if item.get("candidate_id") != chosen["id"]]
             learned.append({"candidate_id": chosen["id"], "title": chosen["title"], "source": str(source_root),
@@ -548,32 +678,86 @@ class RootDNA:
             self.audit("VALIDATED", "remove requested with no deployed links")
             self._reset_profile_definition()
             return f"Restored {restored} migrated file(s), removed {', '.join(removed)}, and reset this RootDNA profile." if restored else "Nothing is deployed for this profile. RootDNA profile reset."
-        definition, game_root, plans = self._plans(); expected = {str(item["target"]): item for item in plans}
+        # Teardown must use the receipt, not rebuild the live plan first.  A
+        # migrated source can be gone while its hardlink is still the only
+        # surviving copy in the game folder; that is a release case, not a
+        # reason to strand every other RootDNA link.
+        definition, game_root = self._validated_definition()
         if manifest.get("profile") not in {None, self.paths.profile_name} or _normal(manifest.get("game_root", game_root)) != _normal(game_root): raise RuntimeError("Manifest belongs to another profile or game root. Not touching it.")
         with self._locked():
             self._guard(definition)
+            orphaned_hardlinks = set()
+            missing_receipts = set()
+            changed_live_files = set()
             for record in manifest.get("links", []):
-                plan = expected.get(record.get("target"))
                 target = Path(record.get("target", "")); source = Path(record.get("source", "")); marker = Path(record.get("marker", ""))
-                if (not plan or record.get("signature") != self._signature(plan)
-                        or not self._marker_matches(marker, self._signature(plan), target, source)
-                        or not self._disk_matches(record, target, source)):
-                    raise RuntimeError(f"Orphan or tampered RootDNA record: {target}. Nothing was removed.")
+                plan = {"id": record.get("id"), "kind": record.get("kind"), "source": source, "target": target}
+                signature = self._signature(plan)
+                if (not isinstance(record.get("id"), str) or record.get("kind") not in {"file", "directory"}
+                        or not _inside(_normal(target), _normal(game_root))
+                        or not _inside(_normal(source), _normal(self.paths.mods))
+                        or record.get("signature") != signature):
+                    raise RuntimeError(self._conflict("manifest", target, source))
+                # This one is deliberately conservative: leave the target in
+                # place only when the signed marker proves RootDNA made this
+                # hardlink and its source vanished later.  It is already back
+                # where a user needs it; deleting it would delete the last
+                # copy just because cleanup is running.
+                orphaned_hardlink = (record.get("link_mode") == "hardlink" and not source.exists()
+                                     and target.is_file() and self._marker_matches(marker, signature, target, source))
+                if orphaned_hardlink:
+                    orphaned_hardlinks.add(str(target))
+                    continue
+                # The source and target can both disappear after an outside
+                # cleanup. The signed marker still proves this receipt is
+                # ours; forget it and keep releasing the rest instead of
+                # making one dead filename hold the whole game hostage.
+                missing_receipt = (not source.exists() and self._target_missing(target)
+                                   and self._marker_matches(marker, signature, target, source))
+                if missing_receipt:
+                    missing_receipts.add(str(target))
+                    continue
+                # A hardlink that became an independent, changed file is no
+                # longer RootDNA-owned at the game-root end. Keep the live
+                # edit, throw away only RootDNA's stale source on release.
+                changed_live_file = (record.get("link_mode") == "hardlink" and source.is_file()
+                                     and target.is_file() and self._marker_matches(marker, signature, target, source)
+                                     and not self._disk_matches(record, target, source))
+                if changed_live_file:
+                    changed_live_files.add(str(target))
+                    continue
+                if not self._marker_or_provable(marker, signature, target, source, record):
+                    raise RuntimeError(self._conflict("manifest", target, source))
+                # A vanished link is safe to forget during removal if the
+                # declared source remains. Do not block cleanup forever over
+                # a file that RootDNA can prove it did not replace.
+                if not self._disk_matches(record, target, source) and not (self._target_missing(target) and source.exists()):
+                    raise RuntimeError(self._conflict("link", target, source))
             for record in manifest.get("links", []):
-                target = Path(record["target"]); target.rmdir() if target.is_dir() else target.unlink()
+                target = Path(record["target"]); orphaned_hardlink = str(target) in orphaned_hardlinks
+                missing_receipt = str(target) in missing_receipts
+                changed_live_file = str(target) in changed_live_files
+                if orphaned_hardlink:
+                    self.audit("RELEASED", f"orphaned hardlink left in game root: {target}")
+                elif missing_receipt:
+                    self.audit("MISSING", f"source and game-root link already absent: {target}")
+                elif changed_live_file:
+                    self.audit("RELEASED", f"changed game-root file left in place: {target}")
+                elif not self._target_missing(target): target.rmdir() if target.is_dir() else target.unlink()
+                else: self.audit("MISSING", f"link already absent: {target}")
                 backup = Path(record["backup"]) if record.get("backup") else None
                 if backup and backup.exists():
                     if target.exists(): raise RuntimeError(f"Restore collision at {target}. Leaving backup alone.")
                     target.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(backup), str(target)); self.audit("RESTORED", str(target))
-                Path(record["marker"]).unlink(missing_ok=True); self.audit("REMOVED", str(target))
+                Path(record["marker"]).unlink(missing_ok=True); self.audit("RELEASED" if (orphaned_hardlink or changed_live_file or missing_receipt) else "REMOVED", str(target))
             self._save_manifest(game_root, {})
-        restored, removed = self._restore_migrated_payloads(definition)
+        restored, removed = self._restore_migrated_payloads(definition, changed_live_files)
         self._reset_profile_definition()
         return f"RootDNA links removed. Restored {restored} adopted file(s), removed {', '.join(removed)}, and reset this RootDNA profile."
 
 class RootDNAPanel(QWidget):
     def __init__(self, paths, plugin_dir, parent=None, lazy=False):
-        super().__init__(parent); self.rootdna = RootDNA(paths, plugin_dir); self.rootdna.reset_status()
+        super().__init__(parent); self.rootdna = RootDNA(paths, plugin_dir); self.changed = False; self.rootdna.reset_status()
         layout = QVBoxLayout(self); body = QHBoxLayout(); left = QVBoxLayout(); right = QVBoxLayout(); body.addLayout(left, 4); body.addLayout(right, 1); layout.addLayout(body)
         left.addWidget(QLabel("RootDNA — exact declared game-root links only. No Data crawl. No freestyle."))
         left.addWidget(QLabel("Candidates are detected read-only. Adoption is explicit; RootDNA never freelances."))
@@ -588,16 +772,21 @@ class RootDNAPanel(QWidget):
         for column, width in enumerate((170, 390, 390, 120)): self.table.setColumnWidth(column, width)
         left.addWidget(self.table)
         buttons = QHBoxLayout()
-        for text, callback in (("Create profile", self.template), ("Dry run", self.dry_run), ("Deploy selected", self.deploy), ("Remove RDNA", self.remove), ("Open definition", self.open_definition), ("Open audit", self.open_audit)):
+        for text, callback in (("Create profile", self.template), ("Scan again", self.scan), ("Dry run", self.dry_run), ("Deploy selected", self.deploy), ("Remove RDNA", self.remove), ("Open definition", self.open_definition), ("Open audit", self.open_audit)):
             button = QPushButton(text, self); button.clicked.connect(callback); buttons.addWidget(button)
         left.addLayout(buttons); right.addWidget(QLabel("Activity log — click a path to open it.")); self.status = QTextBrowser(self); self.status.setOpenLinks(False); self.status.anchorClicked.connect(self._open_status_link); right.addWidget(self.status)
-        clear = QPushButton("Clear status", self); clear.clicked.connect(self._clear_status); right.addWidget(clear)
+        clear = QPushButton("Clear activity log", self); clear.clicked.connect(self._clear_status); right.addWidget(clear)
         self._loaded = False
         if not lazy: self.activate()
     def activate(self):
-        """Pay the broad mod-root scan only when somebody opens this tab."""
-        if self._loaded: return
-        self._loaded = True; self._load_status(); self.refresh()
+        """Refresh whenever the tab is opened; preserve the user's ticks."""
+        # The panel stays alive while the FW window is open.  A one-shot
+        # activation left the candidate list stale after closing/reopening the
+        # dialog or switching tabs, which is precisely when users move mods
+        # around.  refresh() retains checks by candidate id.
+        self._loaded = True
+        self._load_status()
+        self.refresh()
     def say(self, text, paths=()):
         self.rootdna.append_status(text, paths); self._load_status()
     @staticmethod
@@ -625,6 +814,12 @@ class RootDNAPanel(QWidget):
         self.status.clear()
     def _open_status_link(self, url):
         if url.isLocalFile(): QDesktopServices.openUrl(url)
+    def scan(self):
+        try:
+            self.refresh()
+            self.say("Scan finished. Active mixed packages can be adopted into a Root folder; disabled ordinary root mods stay visible but are not deployable.")
+        except Exception as exc:
+            self.rootdna.audit("REFUSED", str(exc)); self.say(f"Scan refused: {exc}")
     def refresh(self):
         # This is read-mostly: it only remembers a placement after somebody has
         # moved it, and refreshes RootDNA's little sorter hint in meta.ini.
@@ -646,7 +841,7 @@ class RootDNAPanel(QWidget):
                 values = (candidate["mod"] + "\nclean game copy", "clean game copy\nrecord only", str(candidate["path"]) + "\nData + executable match", status + "\nno files move")
             else:
                 preview = ", ".join(name for name, _kind in candidate["items"][:3]) + (" …" if candidate["count"] > 3 else "")
-                moving = "moves into a RootDNA mod" if candidate["kind"] == "game-root-payload" else "links straight from this mod"
+                moving = "moves into a RootDNA mod" if candidate["kind"] == "game-root-payload" else "uses this mod's Root folder"
                 values = (candidate["title"] + "\n" + preview, ("game-root payload" if candidate["kind"] == "game-root-payload" else "mod root payload") + "\n" + moving, str(candidate["source"]) + ("\nphysical game root" if candidate["kind"] == "game-root-payload" else "\nMO2 mod source"), f"{candidate['count']} items — {candidate['status']}\nselect to adopt")
             for column, value in enumerate(values, 1): self._cell(self.candidates, row, column, value, (42, 38, 58, 34)[column - 1])
         self._position_select_all(); self._selection_changed()
@@ -662,7 +857,7 @@ class RootDNAPanel(QWidget):
     def template(self):
         try:
             if self.rootdna.definition_path.exists():
-                self.open_definition(); self.say("Definition already exists, so RootDNA opened it instead of stomping on it.")
+                self.open_definition(); self.say("A RootDNA profile already exists. Use Remove RootDNA to reset it; Create profile never overwrites it.")
             else: self.rootdna.create_template(); self.refresh(); self.say("Profile created. Select candidates, then deploy.", (self.rootdna.definition_path,))
         except Exception as exc: self.say(f"Nope: {exc}")
     def _position_select_all(self):
@@ -715,7 +910,10 @@ class RootDNAPanel(QWidget):
                     if any((target / name).exists() for name, _kind in candidate["items"]): raise RuntimeError(f"Would refuse: RootDNA payload already exists at {target}.")
                     notes.append(f"Would move {candidate['count']} {candidate['title']} items to {target}, keep any learned placement, then link them back.")
                 elif candidate["kind"] == "mod-root-payload":
-                    notes.append(f"Would declare {candidate['count']} items from {candidate['source']} and link them into the game root. Nothing gets moved out of that mod.")
+                    if candidate["source_name"] == ".":
+                        notes.append(f"Would move {candidate['count']} declared root item(s) into {candidate['source'] / 'Root'} inside the same mod, then link them into the game root.")
+                    else:
+                        notes.append(f"Would link {candidate['count']} declared item(s) from {candidate['source']} into the game root.")
             for plan, state in self.rootdna.preview(): notes.append(f"Would validate {plan['source']} -> {plan['target']} ({state}).")
             self.say("Dry run — zero writes.\n\n" + ("\n".join(notes) if notes else "No candidate selected and no declared links to deploy."), (self.rootdna.definition_path, self.rootdna.paths.game_root))
         except Exception as exc: self.say(f"Dry run refused: {exc}")
@@ -728,13 +926,17 @@ class RootDNAPanel(QWidget):
             for candidate in selected:
                 if candidate["kind"] == "stock-game": self.rootdna.adopt_stock_game(candidate)
                 elif candidate["kind"] in {"game-root-payload", "mod-root-payload"}: self.rootdna.adopt_root_payload(candidate)
-            self.rootdna.deploy(); self.refresh(); self.say("Selected RootDNA payloads deployed. Check the audit if you want receipts.", (self.rootdna.paths.game_root, self.rootdna.audit_path))
+            withheld = self.rootdna.deploy(); self.refresh()
+            self.changed = True
+            message = "Selected RootDNA payloads deployed. Check the audit if you want receipts." if selected else "Existing RootDNA links checked and deployed. Nothing new was adopted; tick a candidate first if you want RootDNA to create a new Root lane."
+            if withheld: message += " Released disabled source(s): " + ", ".join(withheld) + "."
+            self.say(message, (self.rootdna.paths.game_root, self.rootdna.audit_path))
         except Exception as exc: self.rootdna.audit("REFUSED", str(exc)); self.say(f"Refused: {exc}")
     def adopt_ae_ck(self):
-        try: self.rootdna.adopt_ae_creation_kit(); self.refresh(); self.say("AE Creation Kit moved into RootDNA - Creation Kit, then linked back into the game root.")
+        try: self.rootdna.adopt_ae_creation_kit(); self.changed = True; self.refresh(); self.say("AE Creation Kit moved into RootDNA - Creation Kit, then linked back into the game root.")
         except Exception as exc: self.rootdna.audit("REFUSED", str(exc)); self.say(f"Refused: {exc}")
     def remove(self):
-        try: message = self.rootdna.remove(); self.refresh(); self.say(message, (self.rootdna.paths.game_root, self.rootdna.audit_path))
+        try: message = self.rootdna.remove(); self.changed = True; self.refresh(); self.say(message, (self.rootdna.paths.game_root, self.rootdna.audit_path))
         except Exception as exc: self.rootdna.audit("REFUSED", str(exc)); self.say(f"Refused: {exc}")
     def open_definition(self): QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.rootdna.definition_path)))
     def open_audit(self): QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.rootdna.audit_path)))
